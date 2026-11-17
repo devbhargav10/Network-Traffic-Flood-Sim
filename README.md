@@ -1,58 +1,79 @@
 # Network Traffic Flood Sim
 
-A Windows-first, Docker-based network behavior and telemetry validation platform for authorized Cisco Secure Network Analytics (SNA) lab environments.
+A Windows-first Docker lab controller for authorized network-behavior and Cisco Secure Network Analytics (SNA) telemetry validation.
 
-> **Safety boundary:** This project is designed for isolated, explicitly authorized lab targets. It does not provide unrestricted public-IP flooding, source-IP spoofing, or unbounded traffic generation. Experiments must be destination-allowlisted, rate-limited, time-limited, auditable, and stoppable.
+> **Current release is control-plane only.** It stores bounded experiment plans; it does not launch worker containers or generate packets. Do not treat a planned experiment as generated traffic or SNA evidence.
 
-## Project goals
+## Confirmed lab environment
+- Windows host with Docker Desktop (Linux containers).
+- Windows address reported by PowerShell: `10.5.1.204`.
+- Cisco SNA Flow Collector / Data Store: `10.6.1.94` (Connected).
+- Cisco SNA Data Node: `10.6.1.92` (Connected).
+- Cisco SNA Manager: `10.6.1.93` (Connected).
+- Windows ping to the Flow Collector succeeds.
+- Operator reports existing network devices export NetFlow; no dedicated Flow Sensor is deployed.
+- Collector listen protocol/port and the exporting devices are not yet verified.
 
-- Manage independent Docker host containers on Docker Desktop.
-- Assign and track distinct private container IP addresses.
-- Configure bounded network-behavior profiles for lab validation.
-- Track generated traffic separately from traffic observed by a sensor and flows ingested by SNA.
-- Provide a Windows-friendly dashboard and API.
-- Preserve implementation state in repository handoff files so another session can continue.
+## Safety and networking
+- Explicit private IP/CIDR allowlist; empty configuration denies every target.
+- Hard server-side limits: 50 workers, 60 seconds, 100 events/second, 3,000 aggregate event budget.
+- No unrestricted Internet flooding, source spoofing, reflection/amplification, or unbounded generation.
+- API is bound to Windows localhost by Compose.
+- Docker Desktop container IPs are internal addresses. They are not automatically visible as distinct source addresses outside Docker's managed Linux VM.
+- SNA visibility must be confirmed from actual received flow records. A Docker IP or locally generated counter is not proof of Collector ingestion.
 
-## Environment
+## Start on Windows
+1. Install Docker Desktop and switch to Linux containers.
+2. Copy `.env.example` to `.env`.
+3. Generate a key in PowerShell:
+   ```powershell
+   [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')
+   ```
+4. Put the generated value in `SIM_API_KEY` in `.env`. Keep `SIM_ALLOWED_TARGETS` empty until a specifically authorized lab target has been confirmed.
+5. Start the API:
+   ```powershell
+   docker compose up --build -d
+   docker compose ps
+   docker compose logs -f api
+   ```
+6. Check health:
+   ```powershell
+   Invoke-RestMethod http://127.0.0.1:8010/health
+   Invoke-RestMethod http://127.0.0.1:8010/ready
+   ```
 
-- Host: Windows with Docker Desktop (Linux containers).
-- Monitoring: Cisco SNA Manager, Flow Collector, and Flow Sensor VMs.
-- Hypervisor: not yet identified; monitoring integration must remain hypervisor-agnostic until the virtual-switch capabilities are discovered.
-- Initial scale target: 50 hosts, subject to host resource limits.
+## Authenticated API example
+Set the same secret in the current PowerShell session (do not paste it into tickets or commit it):
+```powershell
+$headers = @{ Authorization = "Bearer $env:SIM_API_KEY" }
+Invoke-RestMethod -Uri http://127.0.0.1:8010/api/v1/limits -Headers $headers
+```
 
-## Important networking limitation
+API endpoints:
+- `GET /health` — liveness, no credentials.
+- `GET /ready` — database readiness, no credentials.
+- `GET /api/v1/limits` — policy limits, bearer key required.
+- `POST /api/v1/experiments` — create a validated plan, bearer key required.
+- `GET /api/v1/experiments` — list plans, bearer key required.
+- `POST /api/v1/experiments/{id}/stop` — cancel an unstarted plan, bearer key required.
+- `GET /api/v1/audit?limit=100` — audit records, bearer key required.
+- `/docs` — interactive OpenAPI docs (API operations still enforce authentication).
 
-Docker Desktop runs Linux containers inside a managed Linux VM. Container bridge addresses are not automatically routable or visible as distinct source addresses outside that environment. The application must never report a container as SNA-visible merely because it has a private Docker IP.
+## Development tests
+```powershell
+cd backend
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements-dev.txt
+python -m pytest
+```
 
-The SNA integration must distinguish:
-1. Container-assigned identity and address.
-2. Traffic measured at the container/worker.
-3. Traffic observed by the Flow Sensor.
-4. Flow records received and processed by the Flow Collector.
+## Roadmap / release gate
+1. Run unit/API tests and Docker build on the actual Windows host.
+2. Add isolated worker lifecycle with resource caps, ownership labels, rollback and real cancellation.
+3. Add narrowly scoped, rate- and duration-bounded traffic profiles.
+4. Confirm Collector NetFlow/IPFIX configuration and actual exporter network path before implementing exporter support.
+5. Add a dashboard for hosts, experiments, audit and telemetry evidence.
+6. Prove the chain: worker-generated -> exporter-sent -> Collector-received -> SNA-visible.
 
-Only evidence from the relevant monitoring point may mark a host as observed by SNA.
-
-## Repository map
-
-- `backend/` — API and orchestration services.
-- `frontend/` — dashboard (to be added after stack discovery).
-- `docs/ARCHITECTURE.md` — system and network design.
-- `docs/OPERATIONS.md` — Windows/Docker setup and operations.
-- `docs/TESTING.md` — verification plan and test evidence.
-- `PROJECT_STATUS.md` — current implementation state.
-- `PROJECT_HANDOFF.md` — exact continuation instructions.
-- `IMPLEMENTATION_LOG.md` — chronological work log.
-
-## Initial status
-
-This repository was empty when implementation began. The first commits establish the project contract and persistent handoff system. Application implementation and verification must be recorded as they are completed; do not infer completion from documentation alone.
-
-## Safety defaults
-
-- No arbitrary Internet destinations.
-- No source-address spoofing.
-- No unbounded packet generation or concurrency.
-- No traffic starts automatically on application startup.
-- A target must be explicitly allowlisted as a lab endpoint.
-- Every experiment has a strict maximum duration and rate/volume budget.
-- An emergency stop must cancel jobs and stop associated containers/processes.
+See [PROJECT_STATUS.md](PROJECT_STATUS.md), [PROJECT_HANDOFF.md](PROJECT_HANDOFF.md), and [docs/TESTING.md](docs/TESTING.md).
