@@ -1,6 +1,8 @@
 # Network Traffic Lab
 
-A Windows-first Docker application for exercising bounded worker concurrency against a **local-only UDP receiver**.
+A Windows-first Docker controller with two bounded execution modes: a local loopback self-test and an optional Windows host agent that sends controlled UDP traffic through one real WLAN client to a separately authorized private test receiver.
+
+For the one-Windows-machine WLAN architecture, see [docs/WINDOWS_WLAN_AGENT.md](docs/WINDOWS_WLAN_AGENT.md). The 50 workers are logical streams sharing one Wi-Fi identity; they are not 50 separate WLAN clients.
 
 ## Safety model
 
