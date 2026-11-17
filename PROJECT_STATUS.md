@@ -4,47 +4,50 @@ Last updated: 2026-11-17
 
 ## Repository baseline
 - Development repository was empty at start.
-- Reference repository `devbhargav10/Network-Traffic-Sim-Prototype` was also empty (GitHub reports size 0).
+- Reference repository `devbhargav10/Network-Traffic-Sim-Prototype` was also empty.
 - No prior source implementation could be migrated or audited.
 
-## Environment constraints
+## Environment facts supplied by operator
 - Windows host with Docker Desktop Linux containers.
-- Cisco SNA Manager, Flow Collector, and Flow Sensor VMs.
-- Hypervisor product and virtual-switch/mirroring capabilities remain unknown.
-- No additional Linux VM is available.
+- Windows source IP reported by PowerShell: `10.5.1.204`.
+- Cisco SNA Flow Collector / Data Store: `10.6.1.94`, Connected.
+- Cisco SNA Data Node: `10.6.1.92`, Connected.
+- Cisco SNA Manager: `10.6.1.93`, Connected.
+- Windows ping to `10.6.1.94` succeeds (4 ms reported).
+- Operator says existing network devices export NetFlow and there is no dedicated Flow Sensor.
+- Collector's actual NetFlow/IPFIX listen configuration and sender device list have not yet been inspected.
+- Hypervisor/virtual-switch details remain unknown.
 
 ## Implemented in GitHub
-- [x] Project scope, safety contract, architecture, operations, test plan, and handoff docs.
 - [x] FastAPI control-plane foundation with SQLite persistence.
-- [x] Health and hard-limit endpoints.
-- [x] Experiment-plan creation/list/stop-state endpoints.
+- [x] Health and readiness endpoints.
+- [x] Bearer API-key authentication for control-plane endpoints.
 - [x] Explicit private target IP/CIDR allowlist; empty allowlist denies all.
-- [x] Worker, duration, rate, and aggregate packet-equivalent budget validation.
+- [x] Worker, duration, rate, and aggregate event budget validation.
+- [x] Experiment-plan creation/list/cancel endpoints.
+- [x] Audit events for plan creation and cancellation.
+- [x] SQLite WAL, busy timeout, parameterized SQL.
 - [x] Dockerfile and localhost-bound Docker Compose API service.
-- [x] Initial policy unit tests.
+- [x] Compose healthcheck, read-only filesystem, dropped Linux capabilities, resource limits.
+- [x] Unit/API tests authored (not yet executed).
 
 ## Not implemented / not verified
-- [ ] Docker worker lifecycle and 50-host orchestration.
-- [ ] Any real traffic generation (current API stores plans only).
-- [ ] Frontend dashboard.
-- [ ] Authentication and user/role management.
-- [ ] Runtime execution of tests; GitHub writes do not execute code.
-- [ ] Windows Docker deployment validation.
-- [ ] Flow export, sensor observation, collector ingestion, and SNA UI verification.
-- [ ] Hypervisor-specific mirror/virtual-switch setup.
+- [ ] Docker worker lifecycle and multi-host orchestration.
+- [ ] Traffic generation (API explicitly remains plan-only).
+- [ ] NetFlow/IPFIX exporter implementation.
+- [ ] Dashboard/frontend.
+- [ ] Role-based users, key rotation and production secret management.
+- [ ] Test execution, Docker build and Windows deployment validation.
+- [ ] Collector ingest configuration, exporter source configuration and SNA flow visibility verification.
+- [ ] Hypervisor-specific network integration.
 
-## Current API limits
+## Current hard limits
 - 50 workers maximum (plan validation only).
 - 60 seconds maximum duration.
-- 100 events/second maximum per plan.
+- 100 events/second maximum.
 - 3,000 aggregate packet-equivalent events per plan.
 - Only private targets explicitly covered by `SIM_ALLOWED_TARGETS`.
 - Traffic generation is disabled.
 
-## Acceptance criteria
-1. Docker workers have unique private addresses, with no claim that Docker IP equals externally visible source IP.
-2. A bounded experiment can only target an explicitly allowlisted lab endpoint.
-3. Hard caps are enforced server-side.
-4. Emergency stop terminates actual running work, not just metadata.
-5. Generated, sensor-observed, exported, collector-accepted, and SNA-visible states have independent evidence.
-6. Tests and Windows deployment pass before release.
+## Release gate
+Do not label production-ready until tests/build pass, runtime authentication and stop controls are verified, the worker runtime is bounded and cancellable, and SNA visibility is independently confirmed.
