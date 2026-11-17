@@ -1,40 +1,40 @@
 # Project Handoff
 
-## Current source of truth
+## Source of truth
 Repository: `devbhargav10/Network-Traffic-Flood-Sim`
 Branch: `main`
 
 ## Reference repository
-`devbhargav10/Network-Traffic-Sim-Prototype` was inspected on 2026-11-17 and is empty (repository size 0). Do not assume it contains a working prototype.
+`devbhargav10/Network-Traffic-Sim-Prototype` was inspected on 2026-11-17 and is empty (GitHub repository size 0). No reference code is available.
 
 ## User environment
 - Windows + Docker Desktop; no extra Linux VM.
-- Cisco SNA Manager, Flow Collector, Flow Sensor VMs.
+- Cisco SNA Manager, Flow Collector, and Flow Sensor VMs.
 - Hypervisor reported as "other"; exact product is unknown.
-- Goal: create multiple independent Docker hosts and validate Cisco SNA visibility and DDoS detections in an authorized lab.
+- Goal: manage multiple Docker lab hosts and validate Cisco SNA visibility and detections.
 
-## Critical design constraint
-Docker Desktop container IPs are internal addresses. They do not guarantee that Cisco SNA sees those IPs as distinct sources. Do not claim source identity is preserved through NAT. Implement explicit telemetry checkpoints: container generated, observation point seen, flow exporter sent, collector accepted, SNA displayed.
+## Current implementation
+- FastAPI control plane, SQLite persistence, Dockerfile, Compose file.
+- Experiment plans can be created, listed, and marked stopped.
+- Explicit private IP/CIDR allowlist via `SIM_ALLOWED_TARGETS`; empty configuration denies all.
+- Caps: 50 workers, 60 seconds, 100 events/second, 3,000 aggregate packet-equivalent events.
+- Tests added but not executed in this environment.
+- **No traffic is generated. No Docker worker containers are orchestrated. No frontend exists. No SNA integration exists.**
+
+## Critical networking constraint
+Docker Desktop containers run behind a managed Linux networking layer. Distinct internal Docker IPs do not prove that Cisco SNA sees those addresses as separate sources. Record separate evidence for generated traffic, sensor observation, exporter sends, collector receipt, and SNA display.
 
 ## Safety contract
-Only bounded experiments to explicitly allowlisted lab endpoints. Never implement unrestricted Internet flooding, spoofed source addresses, reflection/amplification, or unbounded packet rates. Hard duration/rate/byte/worker caps, authentication, audit log, and emergency stop are release blockers.
+Do not add unrestricted Internet flooding, spoofed source addresses, reflection/amplification, or unbounded packet rates. Enforce allowlist and limits server-side. Any future worker must be cancellable, auditable, duration-bounded, and constrained to the configured lab target.
 
-## Next engineering sequence
-1. Inspect current branch and these handoff docs.
-2. Implement backend skeleton and tests without replacing the safety contract.
-3. Implement Docker host lifecycle using Docker Engine API / Docker CLI safely.
-4. Implement allowlist + experiment policy enforcement server-side (not only in UI).
-5. Implement bounded traffic profiles against local/private lab services only.
-6. Implement dashboard and WebSocket status updates.
-7. Implement SNA telemetry adapter only after confirming supported observation/export path for this hypervisor.
-8. Add Windows PowerShell setup/start/stop scripts and compose configuration.
-9. Run automated tests, document actual results, and update this handoff after each meaningful task.
+## Exact next actions
+1. Clone repo and run `python -m pip install -r backend/requirements.txt`.
+2. Add pytest to dev dependencies and run policy tests.
+3. Build with `docker compose build`; start only the API and verify `/health`.
+4. Add a worker manager that provisions idle containers only, with resource limits and ownership labels.
+5. Add an authenticated UI for host inventory and experiment plans.
+6. Only then add bounded lab traffic profiles and real cancellation.
+7. Identify the actual hypervisor before specifying Flow Sensor port mirroring.
+8. Implement telemetry evidence collection and verify end-to-end in SNA.
 
-## Required checkpoint format
-Update `PROJECT_STATUS.md`, `IMPLEMENTATION_LOG.md`, and this file with:
-- files changed
-- commands run
-- test results (include failures)
-- known limitations
-- exact next action
-Do not report a feature as complete until code and tests demonstrate it.
+Update this file, `PROJECT_STATUS.md`, and `IMPLEMENTATION_LOG.md` after each meaningful task. Report test results exactly; do not mark unexecuted tests as passed.
