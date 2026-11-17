@@ -1,0 +1,28 @@
+name: backend-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+      - name: Install dependencies
+        run: pip install -r backend/requirements-dev.txt
+      - name: Run API and worker tests
+        working-directory: backend
+        env:
+          SIM_API_KEY: ci-test-key-012345678901234567890123456789
+          SIM_LOCAL_TRAFFIC_ENABLED: "true"
+        run: python -m pytest -q
+      - name: Build Docker image
+        run: docker build -t network-traffic-lab-api ./backend
