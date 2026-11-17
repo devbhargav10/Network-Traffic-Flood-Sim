@@ -1,0 +1,24 @@
+services:
+  api:
+    build:
+      context: ./backend
+    container_name: network-traffic-lab-api
+    ports:
+      - "127.0.0.1:8010:8010"
+    environment:
+      SIM_DB_PATH: /app/data/simulator.db
+    volumes:
+      - simulator-data:/app/data
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 512m
+    cpus: 1.0
+
+volumes:
+  simulator-data:
