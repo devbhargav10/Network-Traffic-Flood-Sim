@@ -357,6 +357,12 @@ def readiness() -> dict:
     return {"status": "ready", "database": "available", "local_receiver": "127.0.0.1:9999"}
 
 
+def _wlan_active_statuses():
+    with closing(db()) as conn:
+        rows = conn.execute("SELECT status FROM wlan_experiments WHERE status IN ('QUEUED','RUNNING','STOP_REQUESTED')").fetchall()
+    return [row["status"] for row in rows]
+
+
 @app.get("/api/v1/limits", dependencies=[Depends(require_api_key)])
 def limits() -> dict:
     return {
@@ -365,10 +371,12 @@ def limits() -> dict:
         "per_worker_pps": MAX_PER_WORKER_PPS,
         "max_aggregate_pps": MAX_AGGREGATE_PPS,
         "max_total_events": MAX_TOTAL_EVENTS,
-        "receiver": f"{RECEIVER_HOST}:{RECEIVER_PORT}",
-        "target_scope": "local receiver only; external destinations are not supported",
+        "receiver": "Configured private test receiver on Windows agent",
+        "target_scope": "One authorized private test receiver only; WLC management and NetFlow collector addresses are blocked",
+        "wlan_agent_enabled": os.getenv("SIM_WLAN_AGENT_ENABLED", "false").lower() == "true",
         "traffic_generation_enabled": local_enabled(),
         "active_experiments": len(ACTIVE),
+        "active_wlan_experiments": len(_wlan_active_statuses()),
     }
 
 
