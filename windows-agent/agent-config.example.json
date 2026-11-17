@@ -1,4 +1,5 @@
 {
-  "receiver_ip": "192.0.2.10",
-  "receiver_port": 19055
+  "receiver_ip": "192.168.50.20",
+  "receiver_port": 19055,
+  "authorization": "AUTHORIZED_TEST_RECEIVER_NOT_WLC"
 }
