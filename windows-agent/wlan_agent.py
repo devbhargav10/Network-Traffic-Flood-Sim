@@ -45,8 +45,8 @@ async def run_job(job, destination):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setblocking(False)
     start, deadline = loop.time(), loop.time() + duration
+    controller_state = "RUNNING"
     try:
-        tasks = []
         async def worker(worker_id):
             nonlocal sent
             for seq in range(1, duration + 1):
@@ -64,7 +64,8 @@ async def run_job(job, destination):
         tasks = [asyncio.create_task(worker(i)) for i in range(1, workers + 1)]
         while any(not t.done() for t in tasks):
             state = api("GET", "/api/v1/agent/jobs/" + job["id"])
-            if state["status"] == "STOP_REQUESTED":
+            if state["status"] in ("STOP_REQUESTED", "INTERRUPTED", "CANCELLED"):
+                controller_state = state["status"]
                 stop.set()
                 break
             if loop.time() >= deadline:
@@ -74,11 +75,24 @@ async def run_job(job, destination):
             for t in tasks: t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         final = "STOPPED" if stop.is_set() else "COMPLETED"
-        api("POST", "/api/v1/agent/jobs/" + job["id"] + "/report",
-            {"sent": sent, "received": 0, "status": final,
-             "stop_reason": "operator_stop" if stop.is_set() else "duration_elapsed"})
+        if controller_state != "INTERRUPTED":
+            api("POST", "/api/v1/agent/jobs/" + job["id"] + "/report",
+                {"sent": sent, "received": 0, "status": final,
+                 "stop_reason": "operator_stop" if stop.is_set() else "duration_elapsed"})
         print(json.dumps({"job": job["id"], "status": final, "sent": sent,
                           "receiver": destination[0] + ":" + str(destination[1])}))
+    except Exception:
+        stop.set()
+        for task in tasks:
+            if not task.done(): task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            api("POST", "/api/v1/agent/jobs/" + job["id"] + "/report",
+                {"sent": sent, "received": 0, "status": "FAILED", "stop_reason": "agent_or_controller_error"})
+        except Exception:
+            pass
+        raise
     finally:
         for task in tasks:
             if not task.done(): task.cancel()
