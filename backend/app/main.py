@@ -339,6 +339,7 @@ def health() -> dict:
         "service": "network-traffic-lab-controller",
         "mode": "local-receiver-only",
         "traffic_generation_enabled": local_enabled(),
+        "wlan_agent_enabled": os.getenv("SIM_WLAN_AGENT_ENABLED", "false").lower() == "true",
         "active_local_experiments": len(ACTIVE),
     }
 
