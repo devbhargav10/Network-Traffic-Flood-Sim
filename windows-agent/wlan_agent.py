@@ -41,6 +41,7 @@ async def run_job(job, destination):
     loop = asyncio.get_running_loop()
     stop = asyncio.Event()
     sent = 0
+    tasks = []
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setblocking(False)
     start, deadline = loop.time(), loop.time() + duration
@@ -79,6 +80,10 @@ async def run_job(job, destination):
         print(json.dumps({"job": job["id"], "status": final, "sent": sent,
                           "receiver": destination[0] + ":" + str(destination[1])}))
     finally:
+        for task in tasks:
+            if not task.done(): task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         sock.close()
 
 async def main():
