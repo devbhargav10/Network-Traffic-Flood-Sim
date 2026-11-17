@@ -6,7 +6,8 @@ import app.main as main
 @pytest.fixture
 def client(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DB_PATH", tmp_path / "wlan-test.db")
-    monkeypatch.setenv("SIM_API_KEY", "wlan-test-key-" + "x" * 40)
+    monkeypatch.setenv("SIM_API_KEY", "operator-test-key-" + "x" * 40)
+    monkeypatch.setenv("SIM_AGENT_API_KEY", "agent-test-key-" + "x" * 40)
     monkeypatch.setenv("SIM_WLAN_AGENT_ENABLED", "true")
     monkeypatch.setenv("SIM_LOCAL_TRAFFIC_ENABLED", "false")
     with TestClient(main.app) as test_client:
@@ -15,7 +16,13 @@ def client(monkeypatch, tmp_path):
 
 @pytest.fixture
 def headers():
-    return {"Authorization": "Bearer wlan-test-key-" + "x" * 40}
+    return {"Authorization": "Bearer operator-test-key-" + "x" * 40}
+
+
+def test_wlan_agent_routes_require_separate_machine_credential(client, headers):
+    assert client.get("/api/v1/agent/next?agent_id=test-windows", headers=headers).status_code == 401
+    agent_headers = {"Authorization": "Bearer agent-test-key-" + "x" * 40}
+    assert client.get("/api/v1/agent/next?agent_id=test-windows", headers=agent_headers).status_code == 200
 
 
 def test_wlan_agent_mode_limits(client, headers):
@@ -37,12 +44,13 @@ def test_wlan_job_is_queued_then_claimed_and_reported(client, headers):
     assert queued.status_code == 200
     assert queued.json()["status"] == "QUEUED"
 
+    agent_headers = {"Authorization": "Bearer agent-test-key-" + "x" * 40}
     claimed = client.get("/api/v1/agent/next?agent_id=test-windows",
-                         headers=headers)
+                         headers=agent_headers)
     assert claimed.status_code == 200
     assert claimed.json()["job"]["id"] == experiment_id
 
-    state = client.get(f"/api/v1/agent/jobs/{experiment_id}", headers=headers)
+    state = client.get(f"/api/v1/agent/jobs/{experiment_id}", headers=agent_headers)
     assert state.json()["status"] == "RUNNING"
 
     stop = client.post(f"/api/v1/wlan-experiments/{experiment_id}/stop",
@@ -50,7 +58,7 @@ def test_wlan_job_is_queued_then_claimed_and_reported(client, headers):
     assert stop.json()["status"] == "STOP_REQUESTED"
 
     report = client.post(f"/api/v1/agent/jobs/{experiment_id}/report",
-                         headers=headers,
+                         headers=agent_headers,
                          json={"sent": 5, "received": 0, "status": "STOPPED",
                                "stop_reason": "operator_stop"})
     assert report.status_code == 200
