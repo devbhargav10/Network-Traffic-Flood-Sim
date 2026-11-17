@@ -8,6 +8,7 @@ services:
     environment:
       SIM_DB_PATH: /app/data/simulator.db
       SIM_ALLOWED_TARGETS: ${SIM_ALLOWED_TARGETS:-}
+      SIM_API_KEY: ${SIM_API_KEY:?Set SIM_API_KEY in your .env file}
     volumes:
       - simulator-data:/app/data
     restart: unless-stopped
@@ -20,6 +21,12 @@ services:
       - ALL
     mem_limit: 512m
     cpus: 1.0
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/ready', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
 volumes:
   simulator-data:
