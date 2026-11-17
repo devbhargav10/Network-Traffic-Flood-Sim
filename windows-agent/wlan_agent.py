@@ -16,9 +16,14 @@ def load_receiver():
     ip = ipaddress.ip_address(cfg["receiver_ip"])
     if ip.version != 4 or not ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast:
         raise ValueError("receiver_ip must be an explicitly authorized private IPv4 address")
+    blocked = {ipaddress.ip_address(x) for x in ("10.6.1.55", "10.6.1.94", "10.5.1.1")}
+    if ip in blocked:
+        raise ValueError("Refusing known WLC, SNA collector, or gateway address")
+    if cfg.get("authorization") != "AUTHORIZED_TEST_RECEIVER_NOT_WLC":
+        raise ValueError("Set authorization to AUTHORIZED_TEST_RECEIVER_NOT_WLC after verifying the receiver")
     port = int(cfg.get("receiver_port", 19055))
-    if not 1024 <= port <= 65535:
-        raise ValueError("receiver_port must be 1024..65535")
+    if port != 19055:
+        raise ValueError("Receiver port is fixed at UDP 19055; do not use the NetFlow export port")
     return str(ip), port
 
 def api(method, path, body=None):
