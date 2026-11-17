@@ -24,5 +24,7 @@ jobs:
           SIM_API_KEY: ci-test-key-012345678901234567890123456789
           SIM_LOCAL_TRAFFIC_ENABLED: "true"
         run: python -m pytest -q
+      - name: Compile Windows agent and receiver scripts
+        run: python -m py_compile windows-agent/wlan_agent.py receiver/udp_receiver.py
       - name: Build Docker image
         run: docker build -t network-traffic-lab-api ./backend
