@@ -1,79 +1,79 @@
-# Network Traffic Flood Sim
+# Network Traffic Lab
 
-A Windows-first Docker lab controller for authorized network-behavior and Cisco Secure Network Analytics (SNA) telemetry validation.
+A Windows-first Docker application for exercising bounded worker concurrency against a **local-only UDP receiver**.
 
-> **Current release is control-plane only.** It stores bounded experiment plans; it does not launch worker containers or generate packets. Do not treat a planned experiment as generated traffic or SNA evidence.
+## Safety model
 
-## Confirmed lab environment
-- Windows host with Docker Desktop (Linux containers).
-- Windows address reported by PowerShell: `10.5.1.204`.
-- Cisco SNA Flow Collector / Data Store: `10.6.1.94` (Connected).
-- Cisco SNA Data Node: `10.6.1.92` (Connected).
-- Cisco SNA Manager: `10.6.1.93` (Connected).
-- Windows ping to the Flow Collector succeeds.
-- Operator reports existing network devices export NetFlow; no dedicated Flow Sensor is deployed.
-- Collector listen protocol/port and the exporting devices are not yet verified.
+- The receiver and sender bind exclusively to `127.0.0.1` inside the API container.
+- The app does not accept arbitrary target IPs, hostnames, URLs, packet payloads or source addresses.
+- No traffic is sent to a WLC, another LAN device, or the Internet.
+- 50 logical asyncio workers maximum; each sends at most 1 fixed UDP datagram/second.
+- 10 seconds maximum; 50 messages/second aggregate maximum; 500 messages total maximum.
+- Only one experiment may run at a time.
+- API-key authentication, SQLite audit trail, per-experiment stop, global emergency stop and restart recovery are included.
+- Plan creation sends no messages. An explicit Start action is required.
+- Worker tasks run inside the unprivileged API container; they are not 50 separate containers or distinct wireless endpoints.
 
-## Safety and networking
-- Explicit private IP/CIDR allowlist; empty configuration denies every target.
-- Hard server-side limits: 50 workers, 60 seconds, 100 events/second, 3,000 aggregate event budget.
-- No unrestricted Internet flooding, source spoofing, reflection/amplification, or unbounded generation.
-- API is bound to Windows localhost by Compose.
-- Docker Desktop container IPs are internal addresses. They are not automatically visible as distinct source addresses outside Docker's managed Linux VM.
-- SNA visibility must be confirmed from actual received flow records. A Docker IP or locally generated counter is not proof of Collector ingestion.
+## Windows quick start
 
-## Start on Windows
-1. Install Docker Desktop and switch to Linux containers.
-2. Copy `.env.example` to `.env`.
-3. Generate a key in PowerShell:
-   ```powershell
-   [guid]::NewGuid().ToString('N') + [guid]::NewGuid().ToString('N')
-   ```
-4. Put the generated value in `SIM_API_KEY` in `.env`. Keep `SIM_ALLOWED_TARGETS` empty until a specifically authorized lab target has been confirmed.
-5. Start the API:
-   ```powershell
-   docker compose up --build -d
-   docker compose ps
-   docker compose logs -f api
-   ```
-6. Check health:
-   ```powershell
-   Invoke-RestMethod http://127.0.0.1:8010/health
-   Invoke-RestMethod http://127.0.0.1:8010/ready
-   ```
+From the repository root in PowerShell:
 
-## Authenticated API example
-Set the same secret in the current PowerShell session (do not paste it into tickets or commit it):
 ```powershell
-$headers = @{ Authorization = "Bearer $env:SIM_API_KEY" }
-Invoke-RestMethod -Uri http://127.0.0.1:8010/api/v1/limits -Headers $headers
+# Pull the implementation
+git pull origin main
+
+# Keep your existing SIM_API_KEY. Add this setting to .env:
+# SIM_LOCAL_TRAFFIC_ENABLED=true
+notepad .env
+
+# Validate and rebuild
+docker compose config --quiet
+docker compose up --build -d
+
+# Verify
+docker compose ps
+Invoke-RestMethod http://127.0.0.1:8010/health
+Invoke-RestMethod http://127.0.0.1:8010/ready
+
+# Open dashboard
+Start-Process http://127.0.0.1:8010/
 ```
 
-API endpoints:
-- `GET /health` — liveness, no credentials.
-- `GET /ready` — database readiness, no credentials.
-- `GET /api/v1/limits` — policy limits, bearer key required.
-- `POST /api/v1/experiments` — create a validated plan, bearer key required.
-- `GET /api/v1/experiments` — list plans, bearer key required.
-- `POST /api/v1/experiments/{id}/stop` — cancel an unstarted plan, bearer key required.
-- `GET /api/v1/audit?limit=100` — audit records, bearer key required.
-- `/docs` — interactive OpenAPI docs (API operations still enforce authentication).
+Do not paste your API key into chat, source control or screenshots. Enter it into the dashboard's password field; the key is kept only in the current browser tab's JavaScript memory.
 
-## Development tests
+## Dashboard workflow
+
+1. Open `http://127.0.0.1:8010/`.
+2. Enter the `SIM_API_KEY` value from your local `.env` and select Connect.
+3. Select up to 50 workers and up to 10 seconds.
+4. Create plan. This sends no traffic.
+5. Select Start selected plan.
+6. Watch sent/received counters, loss and status.
+7. Use Stop experiment or Emergency stop all when required.
+
+## API
+
+All `/api/v1/*` endpoints require `Authorization: Bearer <SIM_API_KEY>`.
+
+- `GET /api/v1/limits`
+- `POST /api/v1/local-experiments` JSON: `{"workers":50,"duration_seconds":10}`
+- `POST /api/v1/local-experiments/{id}/start`
+- `POST /api/v1/local-experiments/{id}/stop`
+- `POST /api/v1/local-experiments/stop-all`
+- `GET /api/v1/local-experiments`
+- `GET /api/v1/local-experiments/{id}`
+- `GET /api/v1/audit?limit=100`
+
+## Tests
+
 ```powershell
 cd backend
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements-dev.txt
-python -m pytest
+python -m pytest -q
 ```
 
-## Roadmap / release gate
-1. Run unit/API tests and Docker build on the actual Windows host.
-2. Add isolated worker lifecycle with resource caps, ownership labels, rollback and real cancellation.
-3. Add narrowly scoped, rate- and duration-bounded traffic profiles.
-4. Confirm Collector NetFlow/IPFIX configuration and actual exporter network path before implementing exporter support.
-5. Add a dashboard for hosts, experiments, audit and telemetry evidence.
-6. Prove the chain: worker-generated -> exporter-sent -> Collector-received -> SNA-visible.
+## Cisco SNA note
 
-See [PROJECT_STATUS.md](PROJECT_STATUS.md), [PROJECT_HANDOFF.md](PROJECT_HANDOFF.md), and [docs/TESTING.md](docs/TESTING.md).
+This local receiver validates worker concurrency and application lifecycle only. Since all packets terminate inside the API container's loopback interface, they are not WLAN client traffic and will not appear as WLC-originated or client-originated flows in SNA. To test SNA visibility, a separately authorized observation topology is required.
