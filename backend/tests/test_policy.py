@@ -76,3 +76,21 @@ def test_create_cancel_and_audit(monkeypatch, isolated_db):
         assert cancelled.json()["status"] == "CANCELLED"
         events = client.get("/api/v1/audit", headers=headers).json()
         assert [event["event_type"] for event in events] == ["EXPERIMENT_CANCELLED", "EXPERIMENT_PLANNED"]
+
+def test_budget_overflow_is_http_422(monkeypatch, isolated_db):
+    monkeypatch.setenv("SIM_API_KEY", "z" * 40)
+    monkeypatch.setenv("SIM_ALLOWED_TARGETS", "192.168.100.0/24")
+    headers = {"Authorization": "Bearer " + "z" * 40}
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/experiments",
+            headers=headers,
+            json={
+                "target_ip": "192.168.100.20",
+                "protocol": "udp-echo",
+                "workers": 50,
+                "duration_seconds": 60,
+                "rate_pps": 100,
+            },
+        )
+        assert response.status_code == 422
