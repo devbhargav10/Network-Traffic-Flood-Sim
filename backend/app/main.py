@@ -327,6 +327,21 @@ def require_api_key(
                             headers={"WWW-Authenticate": "Bearer"})
     return "api-key"
 
+def require_agent_key(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+) -> str:
+    """Separate machine credential: never reuse the dashboard/operator API key."""
+    configured = os.getenv("SIM_AGENT_API_KEY", "")
+    if len(configured) < API_KEY_MIN_LENGTH:
+        raise HTTPException(status_code=503, detail="Windows agent authentication is not configured")
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Agent bearer token required",
+                            headers={"WWW-Authenticate": "Bearer"})
+    if not hmac.compare_digest(credentials.credentials, configured):
+        raise HTTPException(status_code=401, detail="Invalid agent credential",
+                            headers={"WWW-Authenticate": "Bearer"})
+    return "windows-agent"
+
 
 class LocalExperimentRequest(BaseModel):
     workers: int = Field(default=50, ge=1, le=MAX_WORKERS)
@@ -614,20 +629,27 @@ def stop_all_wlan_experiments() -> dict:
 
 # The Windows agent polls over the existing localhost-published API. It never accepts
 # a destination from the controller; its receiver address is fixed in its local config.
-@app.get("/api/v1/agent/next", dependencies=[Depends(require_api_key)])
+@app.get("/api/v1/agent/next", dependencies=[Depends(require_agent_key)])
 def agent_next_job(agent_id: str = Query(min_length=1, max_length=80)) -> dict:
     if os.getenv("SIM_WLAN_AGENT_ENABLED", "false").lower() != "true":
         raise HTTPException(status_code=403, detail="Windows WLAN agent mode is disabled")
     with closing(db()) as conn:
+        # Serialize claims and make the state transition conditional. This prevents
+        # two pollers from receiving the same queued experiment.
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT * FROM wlan_experiments WHERE status='QUEUED' ORDER BY queued_at LIMIT 1"
         ).fetchone()
         if row is None:
+            conn.commit()
             return {"job": None}
-        conn.execute(
+        changed = conn.execute(
             "UPDATE wlan_experiments SET status='RUNNING', started_at=?, agent_id=? WHERE id=? AND status='QUEUED'",
             (utc_now(), agent_id, row["id"]),
-        )
+        ).rowcount
+        if changed != 1:
+            conn.commit()
+            return {"job": None}
         audit(conn, "WLAN_AGENT_CLAIMED_JOB", row["id"], f"agent_id={agent_id}")
         conn.commit()
     return {"job": {"id": row["id"], "workers": row["workers"],
@@ -637,7 +659,7 @@ def agent_next_job(agent_id: str = Query(min_length=1, max_length=80)) -> dict:
                     "max_events": row["max_events"]}}
 
 
-@app.get("/api/v1/agent/jobs/{experiment_id}", dependencies=[Depends(require_api_key)])
+@app.get("/api/v1/agent/jobs/{experiment_id}", dependencies=[Depends(require_agent_key)])
 def agent_job_status(experiment_id: str) -> dict:
     if os.getenv("SIM_WLAN_AGENT_ENABLED", "false").lower() != "true":
         raise HTTPException(status_code=403, detail="Windows WLAN agent mode is disabled")
@@ -648,7 +670,7 @@ def agent_job_status(experiment_id: str) -> dict:
     return {"id": experiment_id, "status": row["status"]}
 
 
-@app.post("/api/v1/agent/jobs/{experiment_id}/report", dependencies=[Depends(require_api_key)])
+@app.post("/api/v1/agent/jobs/{experiment_id}/report", dependencies=[Depends(require_agent_key)])
 def agent_report(experiment_id: str, report: AgentReport) -> dict:
     if os.getenv("SIM_WLAN_AGENT_ENABLED", "false").lower() != "true":
         raise HTTPException(status_code=403, detail="Windows WLAN agent mode is disabled")
