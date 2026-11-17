@@ -27,6 +27,6 @@ def test_wlan_agent_mode_fails_closed_when_disabled(client):
 
 
 def test_agent_cannot_claim_jobs_when_mode_is_disabled(client):
-    headers = {"Authorization": "Bearer policy-test-key-" + "x" * 40}
+    headers = {"Authorization": "Bearer policy-agent-key-" + "x" * 40}
     response = client.get("/api/v1/agent/next?agent_id=test-host", headers=headers)
     assert response.status_code == 403
