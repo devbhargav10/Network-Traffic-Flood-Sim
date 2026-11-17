@@ -43,6 +43,7 @@ Keep the existing SIM_API_KEY unchanged in the repository-root .env. Add:
 ```dotenv
 SIM_WLAN_AGENT_ENABLED=true
 SIM_LOCAL_TRAFFIC_ENABLED=false
+SIM_AGENT_API_KEY=use-a-different-random-secret-at-least-32-characters
 ```
 
 Then from PowerShell in the repository root:
@@ -67,13 +68,13 @@ Set receiver_ip to the receiver host's private IPv4 address. Keep port 19055. Ke
 Open a second PowerShell window:
 
 ```powershell
-$env:SIM_API_KEY = Read-Host "Paste the existing SIM_API_KEY"
+$env:SIM_AGENT_API_KEY = Read-Host "Paste the SIM_AGENT_API_KEY machine secret"
 $env:SIM_CONTROLLER_URL = "http://127.0.0.1:8010"
 $env:SIM_AGENT_CONFIG = ".\windows-agent\agent-config.json"
 py -3.12 .\windows-agent\wlan_agent.py
 ```
 
-Do not save the key in the script or commit it. Keep the agent window running during the test.
+Do not reuse SIM_API_KEY for the agent. Do not save either secret in scripts or commit them. Keep the agent window running during the test.
 
 ### 4. Run a conservative first test
 
@@ -91,7 +92,7 @@ The dashboard's received/loss fields are marked external because UDP delivery mu
 
 ## Troubleshooting
 
-- No job starts: verify SIM_WLAN_AGENT_ENABLED=true, rebuild compose, and confirm agent is polling without authentication errors.
+- No job starts: verify SIM_WLAN_AGENT_ENABLED=true and SIM_AGENT_API_KEY is set in .env, rebuild compose, and confirm agent is polling without authentication errors. The dashboard continues to use SIM_API_KEY; the Windows agent must use SIM_AGENT_API_KEY.
 - No receiver packets: verify Windows route/interface, receiver IP, receiver UDP/19055 listener, firewall allow rule, and WLAN ACLs.
 - SNA sees nothing: verify the exporter observes the WLAN client-to-receiver data path and exports to 10.6.1.94:2055. A failed TCP test to 2055 says nothing about UDP NetFlow export.
 - WLC shows one client: expected for this single-Windows-host architecture.
