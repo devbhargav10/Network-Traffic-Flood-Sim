@@ -11,7 +11,8 @@ CONFIG = os.getenv("SIM_AGENT_CONFIG", "agent-config.json")
 MAX_WORKERS, MAX_SECONDS, MAX_PPS, MAX_EVENTS = 50, 10, 50, 500
 
 def load_receiver():
-    with open(CONFIG, encoding="utf-8") as f:
+    config_path = os.getenv("SIM_AGENT_CONFIG", "agent-config.json")
+    with open(config_path, encoding="utf-8") as f:
         cfg = json.load(f)
     ip = ipaddress.ip_address(cfg["receiver_ip"])
     if ip.version != 4 or not ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast:
