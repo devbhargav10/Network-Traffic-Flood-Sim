@@ -192,7 +192,10 @@ def limits() -> dict:
 
 @app.post("/api/v1/experiments", status_code=201, dependencies=[Depends(require_api_key)])
 def create_experiment(request: ExperimentRequest) -> dict:
-    request.validate_budget()
+    try:
+        request.validate_budget()
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     experiment_id = str(uuid.uuid4())
     created_at = utc_now()
     with closing(db()) as conn:
