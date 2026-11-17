@@ -5,7 +5,7 @@ from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
 API = os.getenv("SIM_CONTROLLER_URL", "http://127.0.0.1:8010").rstrip("/")
-KEY = os.getenv("SIM_API_KEY", "")
+KEY = os.getenv("SIM_AGENT_API_KEY", "")
 AGENT_ID = os.getenv("SIM_AGENT_ID", platform.node() + "-" + str(uuid.getnode()))
 CONFIG = os.getenv("SIM_AGENT_CONFIG", "agent-config.json")
 MAX_WORKERS, MAX_SECONDS, MAX_PPS, MAX_EVENTS = 50, 10, 50, 500
@@ -103,7 +103,7 @@ async def run_job(job, destination):
 
 async def main():
     if len(KEY) < 32:
-        raise SystemExit("Set SIM_API_KEY to the same 32+ character key used by the controller.")
+        raise SystemExit("Set SIM_AGENT_API_KEY to a separate 32+ character machine credential.")
     destination = load_receiver()
     print("Windows WLAN agent", AGENT_ID, "->", destination, "(50 logical workers max)")
     while True:
