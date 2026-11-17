@@ -93,6 +93,25 @@ def initialize() -> None:
                 finished_at TEXT,
                 stop_reason TEXT
             );
+            CREATE TABLE IF NOT EXISTS wlan_experiments (
+                id TEXT PRIMARY KEY,
+                workers INTEGER NOT NULL,
+                duration_seconds INTEGER NOT NULL,
+                per_worker_pps INTEGER NOT NULL,
+                aggregate_pps INTEGER NOT NULL,
+                max_events INTEGER NOT NULL,
+                sent INTEGER NOT NULL DEFAULT 0,
+                received INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                queued_at TEXT,
+                started_at TEXT,
+                finished_at TEXT,
+                stop_reason TEXT,
+                agent_id TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_wlan_created ON wlan_experiments(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_wlan_status ON wlan_experiments(status);
             CREATE INDEX IF NOT EXISTS idx_experiments_created
                 ON experiments(created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_audit_created
@@ -457,6 +476,181 @@ def get_local_experiment(experiment_id: str) -> dict:
     if runtime:
         result.update(sent=runtime["sent"], received=runtime["received"])
     return result
+
+
+class WLANExperimentRequest(BaseModel):
+    workers: int = Field(default=50, ge=1, le=MAX_WORKERS)
+    duration_seconds: int = Field(default=10, ge=1, le=MAX_DURATION_SECONDS)
+
+
+class AgentReport(BaseModel):
+    sent: int = Field(ge=0, le=MAX_TOTAL_EVENTS)
+    received: int = Field(ge=0, le=MAX_TOTAL_EVENTS)
+    status: str = Field(pattern="^(COMPLETED|STOPPED|FAILED)$")
+    stop_reason: str | None = Field(default=None, max_length=80)
+
+
+@app.post("/api/v1/wlan-experiments", status_code=201, dependencies=[Depends(require_api_key)])
+def create_wlan_experiment(request: WLANExperimentRequest) -> dict:
+    if os.getenv("SIM_WLAN_AGENT_ENABLED", "false").lower() != "true":
+        raise HTTPException(status_code=403, detail="Windows WLAN agent mode is disabled")
+    experiment_id = str(uuid.uuid4())
+    created = utc_now()
+    rate = request.workers * MAX_PER_WORKER_PPS
+    budget = rate * request.duration_seconds
+    with closing(db()) as conn:
+        active = conn.execute(
+            "SELECT 1 FROM wlan_experiments WHERE status IN ('QUEUED','RUNNING','STOP_REQUESTED')"
+        ).fetchone()
+        if active:
+            raise HTTPException(status_code=409, detail="A WLAN agent experiment is already active")
+        conn.execute(
+            """INSERT INTO wlan_experiments
+               (id,workers,duration_seconds,per_worker_pps,aggregate_pps,max_events,status,created_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (experiment_id, request.workers, request.duration_seconds, MAX_PER_WORKER_PPS,
+             rate, budget, "PLANNED", created),
+        )
+        audit(conn, "WLAN_EXPERIMENT_PLANNED", experiment_id,
+              f"workers={request.workers}; duration={request.duration_seconds}; aggregate_pps={rate}")
+        conn.commit()
+    return {"id": experiment_id, "status": "PLANNED", "workers": request.workers,
+            "duration_seconds": request.duration_seconds, "aggregate_pps": rate,
+            "max_events": budget,
+            "message": "Plan only. Start queues the job for the authenticated Windows agent."}
+
+
+@app.get("/api/v1/wlan-experiments", dependencies=[Depends(require_api_key)])
+def list_wlan_experiments(limit: int = Query(default=100, ge=1, le=500)) -> list[dict]:
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT * FROM wlan_experiments ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.get("/api/v1/wlan-experiments/{experiment_id}", dependencies=[Depends(require_api_key)])
+def get_wlan_experiment(experiment_id: str) -> dict:
+    with closing(db()) as conn:
+        row = conn.execute("SELECT * FROM wlan_experiments WHERE id=?", (experiment_id,)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="WLAN experiment not found")
+    return dict(row)
+
+
+@app.post("/api/v1/wlan-experiments/{experiment_id}/start", dependencies=[Depends(require_api_key)])
+def start_wlan_experiment(experiment_id: str) -> dict:
+    if os.getenv("SIM_WLAN_AGENT_ENABLED", "false").lower() != "true":
+        raise HTTPException(status_code=403, detail="Windows WLAN agent mode is disabled")
+    with closing(db()) as conn:
+        row = conn.execute("SELECT * FROM wlan_experiments WHERE id=?", (experiment_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="WLAN experiment not found")
+        if row["status"] != "PLANNED":
+            raise HTTPException(status_code=409, detail=f"Experiment is {row['status']}, not PLANNED")
+        active = conn.execute(
+            "SELECT 1 FROM wlan_experiments WHERE status IN ('QUEUED','RUNNING','STOP_REQUESTED')"
+        ).fetchone()
+        if active:
+            raise HTTPException(status_code=409, detail="Another WLAN experiment is active")
+        conn.execute("UPDATE wlan_experiments SET status='QUEUED', queued_at=? WHERE id=?",
+                     (utc_now(), experiment_id))
+        audit(conn, "WLAN_EXPERIMENT_QUEUED", experiment_id, "Queued for Windows host agent")
+        conn.commit()
+    return {"id": experiment_id, "status": "QUEUED",
+            "message": "Waiting for the Windows agent. No traffic is sent by the API container."}
+
+
+@app.post("/api/v1/wlan-experiments/{experiment_id}/stop", dependencies=[Depends(require_api_key)])
+def stop_wlan_experiment(experiment_id: str) -> dict:
+    with closing(db()) as conn:
+        row = conn.execute("SELECT status FROM wlan_experiments WHERE id=?", (experiment_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="WLAN experiment not found")
+        if row["status"] == "QUEUED":
+            new_status = "CANCELLED"
+            conn.execute("UPDATE wlan_experiments SET status=?, finished_at=?, stop_reason=? WHERE id=?",
+                         (new_status, utc_now(), "cancelled_before_agent_start", experiment_id))
+        elif row["status"] == "RUNNING":
+            new_status = "STOP_REQUESTED"
+            conn.execute("UPDATE wlan_experiments SET status=?, stop_reason=? WHERE id=?",
+                         (new_status, "operator_stop", experiment_id))
+        else:
+            new_status = row["status"]
+        audit(conn, "WLAN_EXPERIMENT_STOP_REQUESTED", experiment_id, "Operator stop")
+        conn.commit()
+    return {"id": experiment_id, "status": new_status}
+
+
+@app.post("/api/v1/wlan-experiments/stop-all", dependencies=[Depends(require_api_key)])
+def stop_all_wlan_experiments() -> dict:
+    with closing(db()) as conn:
+        queued = conn.execute(
+            "UPDATE wlan_experiments SET status='CANCELLED', finished_at=?, stop_reason='global_emergency_stop' WHERE status='QUEUED'",
+            (utc_now(),),
+        ).rowcount
+        running = conn.execute(
+            "UPDATE wlan_experiments SET status='STOP_REQUESTED', stop_reason='global_emergency_stop' WHERE status='RUNNING'"
+        ).rowcount
+        audit(conn, "WLAN_GLOBAL_EMERGENCY_STOP", None, f"queued_cancelled={queued}; running_stop_requested={running}")
+        conn.commit()
+    return {"queued_cancelled": queued, "running_stop_requested": running}
+
+
+# The Windows agent polls over the existing localhost-published API. It never accepts
+# a destination from the controller; its receiver address is fixed in its local config.
+@app.get("/api/v1/agent/next", dependencies=[Depends(require_api_key)])
+def agent_next_job(agent_id: str = Query(min_length=1, max_length=80)) -> dict:
+    with closing(db()) as conn:
+        row = conn.execute(
+            "SELECT * FROM wlan_experiments WHERE status='QUEUED' ORDER BY queued_at LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return {"job": None}
+        conn.execute(
+            "UPDATE wlan_experiments SET status='RUNNING', started_at=?, agent_id=? WHERE id=? AND status='QUEUED'",
+            (utc_now(), agent_id, row["id"]),
+        )
+        audit(conn, "WLAN_AGENT_CLAIMED_JOB", row["id"], f"agent_id={agent_id}")
+        conn.commit()
+    return {"job": {"id": row["id"], "workers": row["workers"],
+                    "duration_seconds": row["duration_seconds"],
+                    "per_worker_pps": row["per_worker_pps"],
+                    "aggregate_pps": row["aggregate_pps"],
+                    "max_events": row["max_events"]}}
+
+
+@app.get("/api/v1/agent/jobs/{experiment_id}", dependencies=[Depends(require_api_key)])
+def agent_job_status(experiment_id: str) -> dict:
+    with closing(db()) as conn:
+        row = conn.execute("SELECT status FROM wlan_experiments WHERE id=?", (experiment_id,)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="WLAN experiment not found")
+    return {"id": experiment_id, "status": row["status"]}
+
+
+@app.post("/api/v1/agent/jobs/{experiment_id}/report", dependencies=[Depends(require_api_key)])
+def agent_report(experiment_id: str, report: AgentReport) -> dict:
+    with closing(db()) as conn:
+        row = conn.execute("SELECT status,max_events FROM wlan_experiments WHERE id=?", (experiment_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="WLAN experiment not found")
+        if row["status"] not in ("RUNNING", "STOP_REQUESTED"):
+            raise HTTPException(status_code=409, detail=f"Cannot report for status {row['status']}")
+        if report.sent > row["max_events"] or report.received > report.sent:
+            raise HTTPException(status_code=422, detail="Reported counters exceed experiment budget")
+        final_status = "STOPPED" if row["status"] == "STOP_REQUESTED" else report.status
+        conn.execute(
+            """UPDATE wlan_experiments SET status=?,sent=?,received=?,finished_at=?,stop_reason=?
+               WHERE id=?""",
+            (final_status, report.sent, report.received, utc_now(),
+             report.stop_reason or ("controller_stop" if final_status == "STOPPED" else "duration_elapsed"),
+             experiment_id),
+        )
+        audit(conn, "WLAN_AGENT_REPORT", experiment_id,
+              f"status={final_status}; sent={report.sent}; received={report.received}")
+        conn.commit()
+    return {"id": experiment_id, "status": final_status}
 
 
 @app.get("/api/v1/experiments", dependencies=[Depends(require_api_key)])
