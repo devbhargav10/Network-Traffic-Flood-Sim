@@ -127,6 +127,12 @@ def initialize() -> None:
                WHERE status IN ('STARTING','RUNNING','STOPPING')""",
             (utc_now(),),
         )
+        conn.execute(
+            """UPDATE wlan_experiments
+               SET status='INTERRUPTED', finished_at=?, stop_reason='controller_restart'
+               WHERE status IN ('QUEUED','RUNNING','STOP_REQUESTED')""",
+            (utc_now(),),
+        )
         conn.commit()
 
 
@@ -610,6 +616,8 @@ def stop_all_wlan_experiments() -> dict:
 # a destination from the controller; its receiver address is fixed in its local config.
 @app.get("/api/v1/agent/next", dependencies=[Depends(require_api_key)])
 def agent_next_job(agent_id: str = Query(min_length=1, max_length=80)) -> dict:
+    if os.getenv("SIM_WLAN_AGENT_ENABLED", "false").lower() != "true":
+        raise HTTPException(status_code=403, detail="Windows WLAN agent mode is disabled")
     with closing(db()) as conn:
         row = conn.execute(
             "SELECT * FROM wlan_experiments WHERE status='QUEUED' ORDER BY queued_at LIMIT 1"
@@ -631,6 +639,8 @@ def agent_next_job(agent_id: str = Query(min_length=1, max_length=80)) -> dict:
 
 @app.get("/api/v1/agent/jobs/{experiment_id}", dependencies=[Depends(require_api_key)])
 def agent_job_status(experiment_id: str) -> dict:
+    if os.getenv("SIM_WLAN_AGENT_ENABLED", "false").lower() != "true":
+        raise HTTPException(status_code=403, detail="Windows WLAN agent mode is disabled")
     with closing(db()) as conn:
         row = conn.execute("SELECT status FROM wlan_experiments WHERE id=?", (experiment_id,)).fetchone()
     if row is None:
@@ -640,6 +650,8 @@ def agent_job_status(experiment_id: str) -> dict:
 
 @app.post("/api/v1/agent/jobs/{experiment_id}/report", dependencies=[Depends(require_api_key)])
 def agent_report(experiment_id: str, report: AgentReport) -> dict:
+    if os.getenv("SIM_WLAN_AGENT_ENABLED", "false").lower() != "true":
+        raise HTTPException(status_code=403, detail="Windows WLAN agent mode is disabled")
     with closing(db()) as conn:
         row = conn.execute("SELECT status,max_events FROM wlan_experiments WHERE id=?", (experiment_id,)).fetchone()
         if row is None:
