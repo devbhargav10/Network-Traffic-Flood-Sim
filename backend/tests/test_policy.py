@@ -8,6 +8,7 @@ import app.main as main
 def client(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DB_PATH", tmp_path / "policy-test.db")
     monkeypatch.setenv("SIM_API_KEY", "policy-test-key-" + "x" * 40)
+    monkeypatch.setenv("SIM_AGENT_API_KEY", "policy-agent-key-" + "x" * 40)
     monkeypatch.setenv("SIM_WLAN_AGENT_ENABLED", "false")
     with TestClient(main.app) as test_client:
         yield test_client
