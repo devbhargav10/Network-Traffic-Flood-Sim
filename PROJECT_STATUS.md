@@ -9,30 +9,42 @@ Last updated: 2026-11-17
 
 ## Environment constraints
 - Windows host with Docker Desktop Linux containers.
-- Cisco SNA Manager, Flow Collector, and Flow Sensor are deployed as VMs.
-- Hypervisor product and virtual-switch/mirroring capabilities are not yet known.
+- Cisco SNA Manager, Flow Collector, and Flow Sensor VMs.
+- Hypervisor product and virtual-switch/mirroring capabilities remain unknown.
 - No additional Linux VM is available.
 
-## Implemented
-- [x] Project README and safety contract.
-- [x] Persistent status, handoff, architecture, operations, and test documentation.
+## Implemented in GitHub
+- [x] Project scope, safety contract, architecture, operations, test plan, and handoff docs.
+- [x] FastAPI control-plane foundation with SQLite persistence.
+- [x] Health and hard-limit endpoints.
+- [x] Experiment-plan creation/list/stop-state endpoints.
+- [x] Explicit private target IP/CIDR allowlist; empty allowlist denies all.
+- [x] Worker, duration, rate, and aggregate packet-equivalent budget validation.
+- [x] Dockerfile and localhost-bound Docker Compose API service.
+- [x] Initial policy unit tests.
 
-## Not yet implemented / not verified
+## Not implemented / not verified
+- [ ] Docker worker lifecycle and 50-host orchestration.
+- [ ] Any real traffic generation (current API stores plans only).
 - [ ] Frontend dashboard.
-- [ ] Backend API and durable experiment store.
-- [ ] Docker host lifecycle/orchestration.
-- [ ] Per-host traffic worker.
-- [ ] Lab target allowlist and experiment guardrails.
-- [ ] Emergency stop.
-- [ ] SNA telemetry/flow ingestion verification.
-- [ ] End-to-end tests on the user's Windows machine.
+- [ ] Authentication and user/role management.
+- [ ] Runtime execution of tests; GitHub writes do not execute code.
+- [ ] Windows Docker deployment validation.
+- [ ] Flow export, sensor observation, collector ingestion, and SNA UI verification.
+- [ ] Hypervisor-specific mirror/virtual-switch setup.
+
+## Current API limits
+- 50 workers maximum (plan validation only).
+- 60 seconds maximum duration.
+- 100 events/second maximum per plan.
+- 3,000 aggregate packet-equivalent events per plan.
+- Only private targets explicitly covered by `SIM_ALLOWED_TARGETS`.
+- Traffic generation is disabled.
 
 ## Acceptance criteria
-1. User can create/manage a bounded pool of independent containers.
-2. Each container has a unique Docker-network IP; the UI labels this as container identity, not proof of external source-IP visibility.
-3. User can define an allowlisted private lab target and a bounded experiment.
-4. Every experiment is rate-, duration-, and resource-limited and can be stopped immediately.
-5. UI reports generated, sensor-observed, and collector-ingested telemetry as separate states.
-6. A failed or unverified SNA observation is shown honestly, never as success.
-7. All operations are auditable and restart-safe.
-8. Tests, docs, and Windows deployment scripts pass before release.
+1. Docker workers have unique private addresses, with no claim that Docker IP equals externally visible source IP.
+2. A bounded experiment can only target an explicitly allowlisted lab endpoint.
+3. Hard caps are enforced server-side.
+4. Emergency stop terminates actual running work, not just metadata.
+5. Generated, sensor-observed, exported, collector-accepted, and SNA-visible states have independent evidence.
+6. Tests and Windows deployment pass before release.
