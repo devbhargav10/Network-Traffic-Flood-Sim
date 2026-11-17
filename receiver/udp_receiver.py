@@ -3,7 +3,7 @@ import argparse, json, socket, time
 from collections import defaultdict
 
 p = argparse.ArgumentParser()
-p.add_argument("--bind", default="0.0.0.0")
+p.add_argument("--bind", required=True, help="Bind only to the receiver host private test-VLAN IP")
 p.add_argument("--port", type=int, default=19055)
 args = p.parse_args()
 if not 1024 <= args.port <= 65535:
