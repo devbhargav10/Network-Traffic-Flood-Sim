@@ -1,13 +1,11 @@
 # Implementation Log
 
-## 2026-11-17 — Repository initialization and control-plane foundation
-- Verified both named GitHub repositories exist but are empty (size 0).
-- Initialized the development repository README and persistent handoff docs.
-- Added architecture, Windows operations, and SNA verification documentation.
-- Added FastAPI control-plane API with SQLite experiment-plan persistence.
-- Added strict private-address validation and explicit `SIM_ALLOWED_TARGETS` CIDR/IP allowlist; no allowlist means deny all.
-- Added plan budget validation and policy tests.
-- Added Dockerfile and Docker Compose service bound to 127.0.0.1:8010.
-- **Not run:** Python tests, Docker build, Windows startup, or SNA telemetry tests. GitHub repository writes do not execute code.
-- **Not implemented:** dashboard, worker containers, traffic execution, exporter, or SNA integration.
-- Next: clone the repository in a runtime with Docker/Python, run tests/build, fix failures, then implement the worker manager and UI behind the existing policy gates.
+## 2026-11-17 — Repository initialization and control-plane hardening
+- Verified both named GitHub repositories were empty at project start.
+- Added FastAPI + SQLite plan-only API and Docker Compose baseline.
+- Added API-key bearer authentication for control-plane endpoints; unauthenticated health/readiness endpoints remain available for local health checks.
+- Added private-target allowlist, hard caps, plan cancellation, audit event records, SQLite WAL and readiness check.
+- Hardened Compose with required API secret, localhost port binding, read-only root filesystem, dropped capabilities, resource limits and healthcheck.
+- Added API/auth/audit tests and test dependencies. Tests have not been run in this remote GitHub editing session.
+- Recorded SNA environment facts supplied by operator: Collector 10.6.1.94, Data Node 10.6.1.92, Manager 10.6.1.93, all Connected; Windows ping to Collector succeeds. Operator says existing devices export NetFlow and there is no dedicated Flow Sensor.
+- Remaining: worker runtime, traffic generation, NetFlow/IPFIX exporter, UI, tests/build and end-to-end SNA validation.
