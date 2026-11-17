@@ -7,6 +7,7 @@ services:
       - "127.0.0.1:8010:8010"
     environment:
       SIM_DB_PATH: /app/data/simulator.db
+      SIM_ALLOWED_TARGETS: ${SIM_ALLOWED_TARGETS:-}
     volumes:
       - simulator-data:/app/data
     restart: unless-stopped
