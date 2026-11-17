@@ -82,6 +82,15 @@ class ExperimentRequest(BaseModel):
             raise ValueError("target_ip must be a valid IPv4 or IPv6 address") from exc
         if not address.is_private or address.is_loopback or address.is_link_local:
             raise ValueError("Only private RFC1918/ULA lab targets are allowed")
+        configured = [item.strip() for item in os.getenv("SIM_ALLOWED_TARGETS", "").split(",") if item.strip()]
+        if not configured:
+            raise ValueError("No lab targets are configured; set SIM_ALLOWED_TARGETS to explicit IPs/CIDRs")
+        try:
+            networks = [ipaddress.ip_network(item, strict=False) for item in configured]
+        except ValueError as exc:
+            raise ValueError("SIM_ALLOWED_TARGETS contains an invalid IP or CIDR") from exc
+        if not any(address.version == network.version and address in network for network in networks):
+            raise ValueError("Target is not inside SIM_ALLOWED_TARGETS")
         return str(address)
 
     def validate_budget(self) -> None:
@@ -108,7 +117,7 @@ def limits() -> dict:
         "max_duration_seconds": MAX_DURATION_SECONDS,
         "max_rate_pps": MAX_RATE_PPS,
         "max_total_packet_equivalents": MAX_TOTAL_PACKETS,
-        "allowed_targets": "private lab addresses only",
+        "allowed_targets": "explicit SIM_ALLOWED_TARGETS IP/CIDR allowlist; deny by default",
         "traffic_generation_enabled": False,
     }
 
