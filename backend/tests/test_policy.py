@@ -1,9 +1,8 @@
-import os
-
 import pytest
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from app.main import ExperimentRequest
+from app.main import ExperimentRequest, app
 
 
 def test_target_is_denied_when_allowlist_is_empty(monkeypatch):
@@ -20,13 +19,7 @@ def test_target_must_match_explicit_allowlist(monkeypatch):
 
 def test_allowlisted_private_target_is_accepted(monkeypatch):
     monkeypatch.setenv("SIM_ALLOWED_TARGETS", "192.168.100.0/24")
-    request = ExperimentRequest(
-        target_ip="192.168.100.20",
-        protocol="tcp-connect",
-        workers=2,
-        duration_seconds=10,
-        rate_pps=5,
-    )
+    request = ExperimentRequest(target_ip="192.168.100.20", protocol="tcp-connect", workers=2)
     request.validate_budget()
 
 
@@ -39,21 +32,42 @@ def test_public_target_is_rejected_even_if_configured(monkeypatch):
 def test_worker_and_duration_caps_are_enforced(monkeypatch):
     monkeypatch.setenv("SIM_ALLOWED_TARGETS", "192.168.100.0/24")
     with pytest.raises(ValidationError):
-        ExperimentRequest(
-            target_ip="192.168.100.20",
-            protocol="udp-echo",
-            workers=51,
-        )
+        ExperimentRequest(target_ip="192.168.100.20", protocol="udp-echo", workers=51)
 
 
 def test_packet_equivalent_budget_is_enforced(monkeypatch):
     monkeypatch.setenv("SIM_ALLOWED_TARGETS", "192.168.100.0/24")
     request = ExperimentRequest(
-        target_ip="192.168.100.20",
-        protocol="udp-echo",
-        workers=50,
-        duration_seconds=60,
-        rate_pps=100,
+        target_ip="192.168.100.20", protocol="udp-echo",
+        workers=50, duration_seconds=60, rate_pps=100,
     )
     with pytest.raises(ValueError):
         request.validate_budget()
+
+
+def test_api_requires_bearer_key(monkeypatch, tmp_path):
+    monkeypatch.setenv("SIM_API_KEY", "x" * 40)
+    monkeypatch.setenv("SIM_DB_PATH", str(tmp_path / "test.db"))
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+        assert client.get("/api/v1/limits").status_code == 401
+        assert client.get("/api/v1/limits", headers={"Authorization": "Bearer " + "x" * 40}).status_code == 200
+
+
+def test_create_cancel_and_audit(monkeypatch, tmp_path):
+    monkeypatch.setenv("SIM_API_KEY", "k" * 40)
+    monkeypatch.setenv("SIM_ALLOWED_TARGETS", "192.168.100.0/24")
+    monkeypatch.setenv("SIM_DB_PATH", str(tmp_path / "test.db"))
+    headers = {"Authorization": "Bearer " + "k" * 40}
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/experiments",
+            headers=headers,
+            json={"target_ip": "192.168.100.20", "protocol": "tcp-connect"},
+        )
+        assert created.status_code == 201
+        experiment_id = created.json()["id"]
+        cancelled = client.post(f"/api/v1/experiments/{experiment_id}/stop", headers=headers)
+        assert cancelled.status_code == 200
+        assert cancelled.json()["status"] == "CANCELLED"
+        assert client.get("/api/v1/audit", headers=headers).json()[0]["event_type"] == "EXPERIMENT_CANCELLED"
