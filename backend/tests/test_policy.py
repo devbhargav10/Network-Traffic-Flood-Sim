@@ -2,7 +2,13 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+import app.main as main
 from app.main import ExperimentRequest, app
+
+
+@pytest.fixture
+def isolated_db(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "test.db")
 
 
 def test_target_is_denied_when_allowlist_is_empty(monkeypatch):
@@ -45,19 +51,17 @@ def test_packet_equivalent_budget_is_enforced(monkeypatch):
         request.validate_budget()
 
 
-def test_api_requires_bearer_key(monkeypatch, tmp_path):
+def test_api_requires_bearer_key(monkeypatch, isolated_db):
     monkeypatch.setenv("SIM_API_KEY", "x" * 40)
-    monkeypatch.setenv("SIM_DB_PATH", str(tmp_path / "test.db"))
     with TestClient(app) as client:
         assert client.get("/health").status_code == 200
         assert client.get("/api/v1/limits").status_code == 401
         assert client.get("/api/v1/limits", headers={"Authorization": "Bearer " + "x" * 40}).status_code == 200
 
 
-def test_create_cancel_and_audit(monkeypatch, tmp_path):
+def test_create_cancel_and_audit(monkeypatch, isolated_db):
     monkeypatch.setenv("SIM_API_KEY", "k" * 40)
     monkeypatch.setenv("SIM_ALLOWED_TARGETS", "192.168.100.0/24")
-    monkeypatch.setenv("SIM_DB_PATH", str(tmp_path / "test.db"))
     headers = {"Authorization": "Bearer " + "k" * 40}
     with TestClient(app) as client:
         created = client.post(
@@ -70,4 +74,5 @@ def test_create_cancel_and_audit(monkeypatch, tmp_path):
         cancelled = client.post(f"/api/v1/experiments/{experiment_id}/stop", headers=headers)
         assert cancelled.status_code == 200
         assert cancelled.json()["status"] == "CANCELLED"
-        assert client.get("/api/v1/audit", headers=headers).json()[0]["event_type"] == "EXPERIMENT_CANCELLED"
+        events = client.get("/api/v1/audit", headers=headers).json()
+        assert [event["event_type"] for event in events] == ["EXPERIMENT_CANCELLED", "EXPERIMENT_PLANNED"]
