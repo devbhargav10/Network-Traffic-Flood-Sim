@@ -1,31 +1,44 @@
-"""Authenticated, policy-enforcing control plane for an authorized network lab.
+"""Authenticated local-only traffic lab with bounded asyncio workers.
 
-This release stores experiment plans only. It does not create workers or send traffic.
+Workers send fixed-format UDP diagnostics only to the receiver bound to 127.0.0.1.
+No raw sockets, Docker socket, host networking, arbitrary target or external egress.
 """
 from __future__ import annotations
 
+import asyncio
 import hmac
-import ipaddress
+import json
 import os
 import sqlite3
 import uuid
 from contextlib import asynccontextmanager, closing
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("SIM_DB_PATH", str(APP_DIR.parent / "data" / "simulator.db")))
-MAX_WORKERS = 50
-MAX_DURATION_SECONDS = 60
-MAX_RATE_PPS = 100
-MAX_TOTAL_EVENTS = 3000
+WEB_DIR = APP_DIR / "static"
 API_KEY_MIN_LENGTH = 32
+MAX_WORKERS = 50
+MAX_DURATION_SECONDS = 10
+MAX_PER_WORKER_PPS = 1
+MAX_AGGREGATE_PPS = 50
+MAX_TOTAL_EVENTS = 500
+RECEIVER_HOST = "127.0.0.1"
+RECEIVER_PORT = 9999
 bearer = HTTPBearer(auto_error=False)
+
+ACTIVE: dict[str, dict[str, Any]] = {}
+receiver_transport: asyncio.DatagramTransport | None = None
+sender_transport: asyncio.DatagramTransport | None = None
+receiver_protocol: "LocalReceiver | None" = None
+runtime_lock: asyncio.Lock | None = None
 
 
 def utc_now() -> str:
@@ -64,54 +77,38 @@ def initialize() -> None:
                 details TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS local_experiments (
+                id TEXT PRIMARY KEY,
+                profile TEXT NOT NULL,
+                workers INTEGER NOT NULL,
+                duration_seconds INTEGER NOT NULL,
+                per_worker_pps INTEGER NOT NULL,
+                aggregate_pps INTEGER NOT NULL,
+                max_events INTEGER NOT NULL,
+                sent INTEGER NOT NULL DEFAULT 0,
+                received INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                stop_reason TEXT
+            );
             CREATE INDEX IF NOT EXISTS idx_experiments_created
                 ON experiments(created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_audit_created
                 ON audit_events(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_local_created
+                ON local_experiments(created_at DESC);
             """
         )
+        # Never resume traffic after a process/container restart.
+        conn.execute(
+            """UPDATE local_experiments
+               SET status='INTERRUPTED', finished_at=?, stop_reason='controller_restart'
+               WHERE status IN ('STARTING','RUNNING','STOPPING')""",
+            (utc_now(),),
+        )
         conn.commit()
-
-
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    initialize()
-    yield
-
-
-app = FastAPI(
-    title="Network Traffic Lab Controller",
-    version="0.2.0",
-    description=(
-        "Authenticated control-plane foundation for authorized lab experiments. "
-        "This release stores plans only; it does not generate traffic."
-    ),
-    lifespan=lifespan,
-)
-
-
-def require_api_key(
-    credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
-) -> str:
-    configured = os.getenv("SIM_API_KEY", "")
-    if len(configured) < API_KEY_MIN_LENGTH:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="API authentication is not configured; set a random SIM_API_KEY of at least 32 characters",
-        )
-    if credentials is None or credentials.scheme.lower() != "bearer":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Bearer API key required",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    if not hmac.compare_digest(credentials.credentials, configured):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    return "api-key"
 
 
 def audit(conn: sqlite3.Connection, event_type: str, resource_id: str | None, details: str) -> None:
@@ -121,41 +118,199 @@ def audit(conn: sqlite3.Connection, event_type: str, resource_id: str | None, de
     )
 
 
-class ExperimentRequest(BaseModel):
-    target_ip: str
-    protocol: Literal["tcp-connect", "http-get", "udp-echo", "icmp"]
-    workers: int = Field(default=1, ge=1, le=MAX_WORKERS)
+def local_enabled() -> bool:
+    return os.getenv("SIM_LOCAL_TRAFFIC_ENABLED", "false").strip().lower() == "true"
+
+
+def update_local(experiment_id: str, **fields: Any) -> None:
+    allowed = {"status", "sent", "received", "started_at", "finished_at", "stop_reason"}
+    if not fields or not set(fields).issubset(allowed):
+        raise ValueError("Invalid local experiment update")
+    assignments = ", ".join(f"{key}=?" for key in fields)
+    values = list(fields.values()) + [experiment_id]
+    with closing(db()) as conn:
+        conn.execute(f"UPDATE local_experiments SET {assignments} WHERE id=?", values)
+        conn.commit()
+
+
+class LocalReceiver(asyncio.DatagramProtocol):
+    """A loopback-only sink. It accepts only this application's small test frames."""
+
+    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        if addr[0] != "127.0.0.1" or len(data) > 256:
+            return
+        try:
+            frame = json.loads(data.decode("utf-8"))
+            experiment_id = str(frame["experiment_id"])
+            worker_id = int(frame["worker_id"])
+            sequence = int(frame["sequence"])
+        except (ValueError, KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+            return
+        runtime = ACTIVE.get(experiment_id)
+        if runtime is None or not (1 <= worker_id <= runtime["workers"]):
+            return
+        if not (1 <= sequence <= MAX_DURATION_SECONDS):
+            return
+        runtime["received"] += 1
+        try:
+            update_local(experiment_id, received=runtime["received"])
+        except sqlite3.Error:
+            runtime["receiver_errors"] += 1
+
+
+async def wait_or_stop(event: asyncio.Event, delay: float) -> bool:
+    try:
+        await asyncio.wait_for(event.wait(), timeout=max(0.0, delay))
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
+async def run_worker(experiment_id: str, worker_id: int, runtime: dict[str, Any]) -> None:
+    loop = asyncio.get_running_loop()
+    start = runtime["start_monotonic"]
+    deadline = runtime["deadline"]
+    for sequence in range(1, MAX_DURATION_SECONDS + 1):
+        due = start + (sequence - 1) + ((worker_id - 1) / MAX_WORKERS)
+        if loop.time() >= deadline or runtime["stop_event"].is_set():
+            return
+        if await wait_or_stop(runtime["stop_event"], due - loop.time()):
+            return
+        if loop.time() >= deadline or runtime["stop_event"].is_set():
+            return
+        frame = json.dumps(
+            {"experiment_id": experiment_id, "worker_id": worker_id, "sequence": sequence},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        # The sender and receiver are both loopback-bound inside this process/container.
+        sender_transport.sendto(frame, (RECEIVER_HOST, RECEIVER_PORT))
+        runtime["sent"] += 1
+        update_local(experiment_id, sent=runtime["sent"])
+
+
+async def run_experiment(experiment_id: str, runtime: dict[str, Any]) -> None:
+    try:
+        await asyncio.gather(
+            *(run_worker(experiment_id, worker_id, runtime)
+              for worker_id in range(1, runtime["workers"] + 1))
+        )
+        final_status = "STOPPED" if runtime["stop_event"].is_set() else "COMPLETED"
+        reason = runtime.get("stop_reason") or ("operator_stop" if final_status == "STOPPED" else "duration_elapsed")
+        update_local(
+            experiment_id,
+            status=final_status,
+            finished_at=utc_now(),
+            stop_reason=reason,
+            sent=runtime["sent"],
+            received=runtime["received"],
+        )
+        with closing(db()) as conn:
+            audit(conn, f"LOCAL_EXPERIMENT_{final_status}", experiment_id,
+                  f"sent={runtime['sent']}; received={runtime['received']}; reason={reason}")
+            conn.commit()
+    except asyncio.CancelledError:
+        update_local(experiment_id, status="STOPPED", finished_at=utc_now(),
+                     stop_reason="controller_shutdown", sent=runtime["sent"],
+                     received=runtime["received"])
+        raise
+    except Exception as exc:
+        update_local(experiment_id, status="FAILED", finished_at=utc_now(),
+                     stop_reason=type(exc).__name__, sent=runtime["sent"],
+                     received=runtime["received"])
+        with closing(db()) as conn:
+            audit(conn, "LOCAL_EXPERIMENT_FAILED", experiment_id, type(exc).__name__)
+            conn.commit()
+    finally:
+        ACTIVE.pop(experiment_id, None)
+
+
+async def stop_one(experiment_id: str, reason: str) -> dict:
+    runtime = ACTIVE.get(experiment_id)
+    if runtime is None:
+        with closing(db()) as conn:
+            row = conn.execute("SELECT status FROM local_experiments WHERE id=?", (experiment_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Local experiment not found")
+        return {"id": experiment_id, "status": row["status"]}
+    runtime["stop_reason"] = reason
+    runtime["stop_event"].set()
+    update_local(experiment_id, status="STOPPING")
+    runner = runtime.get("runner")
+    if runner is not None:
+        try:
+            await asyncio.wait_for(asyncio.shield(runner), timeout=2.0)
+        except asyncio.TimeoutError:
+            runner.cancel()
+            await asyncio.gather(runner, return_exceptions=True)
+    with closing(db()) as conn:
+        row = conn.execute("SELECT status FROM local_experiments WHERE id=?", (experiment_id,)).fetchone()
+        audit(conn, "LOCAL_EXPERIMENT_STOP_REQUESTED", experiment_id, reason)
+        conn.commit()
+    return {"id": experiment_id, "status": row["status"] if row else "STOPPED"}
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    global receiver_transport, sender_transport, receiver_protocol, runtime_lock
+    initialize()
+    runtime_lock = asyncio.Lock()
+    loop = asyncio.get_running_loop()
+    receiver_transport, receiver_protocol = await loop.create_datagram_endpoint(
+        LocalReceiver, local_addr=(RECEIVER_HOST, RECEIVER_PORT)
+    )
+    sender_transport, _ = await loop.create_datagram_endpoint(
+        asyncio.DatagramProtocol, local_addr=(RECEIVER_HOST, 0)
+    )
+    yield
+    for experiment_id in list(ACTIVE):
+        runtime = ACTIVE.get(experiment_id)
+        if runtime:
+            runtime["stop_reason"] = "controller_shutdown"
+            runtime["stop_event"].set()
+            if runtime.get("runner"):
+                runtime["runner"].cancel()
+    if ACTIVE:
+        await asyncio.gather(
+            *(r["runner"] for r in list(ACTIVE.values()) if r.get("runner")),
+            return_exceptions=True,
+        )
+    if sender_transport:
+        sender_transport.close()
+    if receiver_transport:
+        receiver_transport.close()
+
+
+app = FastAPI(
+    title="Network Traffic Lab Controller",
+    version="1.0.0",
+    description="Authenticated local-only traffic lab with 50 bounded asyncio workers.",
+    lifespan=lifespan,
+)
+
+
+def require_api_key(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+) -> str:
+    configured = os.getenv("SIM_API_KEY", "")
+    if len(configured) < API_KEY_MIN_LENGTH:
+        raise HTTPException(status_code=503, detail="API authentication is not configured")
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Bearer API key required",
+                            headers={"WWW-Authenticate": "Bearer"})
+    if not hmac.compare_digest(credentials.credentials, configured):
+        raise HTTPException(status_code=401, detail="Invalid API key",
+                            headers={"WWW-Authenticate": "Bearer"})
+    return "api-key"
+
+
+class LocalExperimentRequest(BaseModel):
+    workers: int = Field(default=50, ge=1, le=MAX_WORKERS)
     duration_seconds: int = Field(default=10, ge=1, le=MAX_DURATION_SECONDS)
-    rate_pps: int = Field(default=5, ge=1, le=MAX_RATE_PPS)
 
-    @field_validator("target_ip")
-    @classmethod
-    def validate_lab_target(cls, value: str) -> str:
-        try:
-            address = ipaddress.ip_address(value)
-        except ValueError as exc:
-            raise ValueError("target_ip must be a valid IP address") from exc
-        if not address.is_private or address.is_loopback or address.is_link_local:
-            raise ValueError("Only private lab IP addresses are allowed")
-        configured = [
-            item.strip()
-            for item in os.getenv("SIM_ALLOWED_TARGETS", "").split(",")
-            if item.strip()
-        ]
-        if not configured:
-            raise ValueError("No lab targets configured; set SIM_ALLOWED_TARGETS to explicit IPs/CIDRs")
-        try:
-            networks = [ipaddress.ip_network(item, strict=False) for item in configured]
-        except ValueError as exc:
-            raise ValueError("SIM_ALLOWED_TARGETS contains an invalid IP or CIDR") from exc
-        if not any(address.version == network.version and address in network for network in networks):
-            raise ValueError("Target is not inside SIM_ALLOWED_TARGETS")
-        return str(address)
 
-    def validate_budget(self) -> None:
-        total = self.workers * self.duration_seconds * self.rate_pps
-        if total > MAX_TOTAL_EVENTS:
-            raise ValueError(f"Requested budget ({total}) exceeds {MAX_TOTAL_EVENTS} events")
+@app.get("/", include_in_schema=False)
+def dashboard() -> FileResponse:
+    return FileResponse(WEB_DIR / "index.html")
 
 
 @app.get("/health")
@@ -163,8 +318,9 @@ def health() -> dict:
     return {
         "status": "ok",
         "service": "network-traffic-lab-controller",
-        "mode": "control-plane-only",
-        "traffic_generation_enabled": False,
+        "mode": "local-receiver-only",
+        "traffic_generation_enabled": local_enabled(),
+        "active_local_experiments": len(ACTIVE),
     }
 
 
@@ -173,9 +329,12 @@ def readiness() -> dict:
     try:
         with closing(db()) as conn:
             conn.execute("SELECT 1").fetchone()
+        receiver_ready = receiver_transport is not None and not receiver_transport.is_closing()
     except sqlite3.Error as exc:
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
-    return {"status": "ready", "database": "available"}
+    if not receiver_ready:
+        raise HTTPException(status_code=503, detail="Local receiver unavailable")
+    return {"status": "ready", "database": "available", "local_receiver": "127.0.0.1:9999"}
 
 
 @app.get("/api/v1/limits", dependencies=[Depends(require_api_key)])
@@ -183,65 +342,142 @@ def limits() -> dict:
     return {
         "max_workers": MAX_WORKERS,
         "max_duration_seconds": MAX_DURATION_SECONDS,
-        "max_rate_pps": MAX_RATE_PPS,
+        "per_worker_pps": MAX_PER_WORKER_PPS,
+        "max_aggregate_pps": MAX_AGGREGATE_PPS,
         "max_total_events": MAX_TOTAL_EVENTS,
-        "allowed_targets": "explicit SIM_ALLOWED_TARGETS IP/CIDR allowlist; deny by default",
-        "traffic_generation_enabled": False,
+        "receiver": f"{RECEIVER_HOST}:{RECEIVER_PORT}",
+        "target_scope": "local receiver only; external destinations are not supported",
+        "traffic_generation_enabled": local_enabled(),
+        "active_experiments": len(ACTIVE),
     }
 
 
-@app.post("/api/v1/experiments", status_code=201, dependencies=[Depends(require_api_key)])
-def create_experiment(request: ExperimentRequest) -> dict:
-    try:
-        request.validate_budget()
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+@app.post("/api/v1/local-experiments", status_code=201, dependencies=[Depends(require_api_key)])
+def create_local_experiment(request: LocalExperimentRequest) -> dict:
+    if not local_enabled():
+        raise HTTPException(status_code=403, detail="Local traffic execution is disabled; set SIM_LOCAL_TRAFFIC_ENABLED=true")
     experiment_id = str(uuid.uuid4())
     created_at = utc_now()
+    aggregate_pps = request.workers * MAX_PER_WORKER_PPS
+    max_events = aggregate_pps * request.duration_seconds
+    if max_events > MAX_TOTAL_EVENTS:
+        raise HTTPException(status_code=422, detail="Experiment exceeds the 500-message budget")
     with closing(db()) as conn:
+        if conn.execute("SELECT 1 FROM local_experiments WHERE status IN ('STARTING','RUNNING','STOPPING')").fetchone():
+            raise HTTPException(status_code=409, detail="Another local experiment is active")
         conn.execute(
-            """
-            INSERT INTO experiments
-            (id, target_ip, protocol, workers, duration_seconds, rate_pps, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'PLANNED', ?)
-            """,
-            (
-                experiment_id, request.target_ip, request.protocol, request.workers,
-                request.duration_seconds, request.rate_pps, created_at,
-            ),
+            """INSERT INTO local_experiments
+               (id,profile,workers,duration_seconds,per_worker_pps,aggregate_pps,max_events,status,created_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (experiment_id, "local-udp-loopback", request.workers, request.duration_seconds,
+             MAX_PER_WORKER_PPS, aggregate_pps, max_events, "PLANNED", created_at),
         )
-        audit(conn, "EXPERIMENT_PLANNED", experiment_id, "Validated plan stored; no traffic sent")
+        audit(conn, "LOCAL_EXPERIMENT_PLANNED", experiment_id,
+              f"workers={request.workers}; duration={request.duration_seconds}; receiver=loopback")
         conn.commit()
-    return {
-        "id": experiment_id,
-        "status": "PLANNED",
-        "created_at": created_at,
-        "message": "Plan stored only. No containers were started and no traffic was sent.",
-    }
+    return {"id": experiment_id, "status": "PLANNED", "workers": request.workers,
+            "duration_seconds": request.duration_seconds, "aggregate_pps": aggregate_pps,
+            "max_events": max_events, "receiver": f"{RECEIVER_HOST}:{RECEIVER_PORT}",
+            "message": "Plan created only. No messages sent until explicit start."}
+
+
+@app.post("/api/v1/local-experiments/stop-all", dependencies=[Depends(require_api_key)])
+async def stop_all() -> dict:
+    stopped = []
+    for experiment_id in list(ACTIVE):
+        stopped.append(await stop_one(experiment_id, "global_emergency_stop"))
+    with closing(db()) as conn:
+        audit(conn, "GLOBAL_EMERGENCY_STOP", None, f"active_experiments_stopped={len(stopped)}")
+        conn.commit()
+    return {"stopped": stopped, "count": len(stopped)}
+
+
+@app.post("/api/v1/local-experiments/{experiment_id}/start", dependencies=[Depends(require_api_key)])
+async def start_local_experiment(experiment_id: str) -> dict:
+    if not local_enabled():
+        raise HTTPException(status_code=403, detail="Local traffic execution is disabled")
+    if sender_transport is None or sender_transport.is_closing():
+        raise HTTPException(status_code=503, detail="Local sender unavailable")
+    async with runtime_lock:
+        with closing(db()) as conn:
+            row = conn.execute("SELECT * FROM local_experiments WHERE id=?", (experiment_id,)).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="Local experiment not found")
+            if row["status"] != "PLANNED":
+                raise HTTPException(status_code=409, detail=f"Experiment is {row['status']}, not PLANNED")
+            if conn.execute("SELECT 1 FROM local_experiments WHERE status IN ('STARTING','RUNNING','STOPPING')").fetchone():
+                raise HTTPException(status_code=409, detail="Another local experiment is active")
+            started_at = utc_now()
+            conn.execute("UPDATE local_experiments SET status='RUNNING', started_at=? WHERE id=?",
+                         (started_at, experiment_id))
+            audit(conn, "LOCAL_EXPERIMENT_STARTED", experiment_id, "Local loopback worker tasks launched")
+            conn.commit()
+        loop = asyncio.get_running_loop()
+        runtime = {
+            "workers": row["workers"],
+            "duration": row["duration_seconds"],
+            "sent": 0,
+            "received": 0,
+            "receiver_errors": 0,
+            "stop_event": asyncio.Event(),
+            "start_monotonic": loop.time(),
+            "deadline": loop.time() + row["duration_seconds"],
+            "stop_reason": None,
+        }
+        ACTIVE[experiment_id] = runtime
+        runtime["runner"] = asyncio.create_task(run_experiment(experiment_id, runtime))
+    return {"id": experiment_id, "status": "RUNNING", "workers": row["workers"],
+            "duration_seconds": row["duration_seconds"],
+            "aggregate_pps": row["aggregate_pps"], "max_events": row["max_events"],
+            "receiver": f"{RECEIVER_HOST}:{RECEIVER_PORT}"}
+
+
+@app.post("/api/v1/local-experiments/{experiment_id}/stop", dependencies=[Depends(require_api_key)])
+async def stop_local_experiment(experiment_id: str) -> dict:
+    return await stop_one(experiment_id, "operator_stop")
+
+
+@app.get("/api/v1/local-experiments", dependencies=[Depends(require_api_key)])
+def list_local_experiments(limit: int = Query(default=100, ge=1, le=500)) -> list[dict]:
+    with closing(db()) as conn:
+        rows = conn.execute(
+            "SELECT * FROM local_experiments ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+@app.get("/api/v1/local-experiments/{experiment_id}", dependencies=[Depends(require_api_key)])
+def get_local_experiment(experiment_id: str) -> dict:
+    with closing(db()) as conn:
+        row = conn.execute("SELECT * FROM local_experiments WHERE id=?", (experiment_id,)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Local experiment not found")
+    result = dict(row)
+    runtime = ACTIVE.get(experiment_id)
+    if runtime:
+        result.update(sent=runtime["sent"], received=runtime["received"])
+    return result
 
 
 @app.get("/api/v1/experiments", dependencies=[Depends(require_api_key)])
-def list_experiments() -> list[dict]:
+def list_legacy_experiments() -> list[dict]:
     with closing(db()) as conn:
         rows = conn.execute("SELECT * FROM experiments ORDER BY created_at DESC LIMIT 500").fetchall()
     return [dict(row) for row in rows]
 
 
 @app.post("/api/v1/experiments/{experiment_id}/stop", dependencies=[Depends(require_api_key)])
-def stop_experiment(experiment_id: str) -> dict:
+def stop_legacy_experiment(experiment_id: str) -> dict:
     stopped_at = utc_now()
     with closing(db()) as conn:
-        row = conn.execute("SELECT status FROM experiments WHERE id = ?", (experiment_id,)).fetchone()
+        row = conn.execute("SELECT status FROM experiments WHERE id=?", (experiment_id,)).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="Experiment not found")
         if row["status"] == "CANCELLED":
             return {"id": experiment_id, "status": "CANCELLED"}
-        # This release only creates plans. Do not pretend to stop a worker process.
-        conn.execute(
-            "UPDATE experiments SET status = 'CANCELLED', stopped_at = ? WHERE id = ?",
-            (stopped_at, experiment_id),
-        )
-        audit(conn, "EXPERIMENT_CANCELLED", experiment_id, "Unstarted plan cancelled")
+        conn.execute("UPDATE experiments SET status='CANCELLED', stopped_at=? WHERE id=?",
+                     (stopped_at, experiment_id))
+        audit(conn, "EXPERIMENT_CANCELLED", experiment_id, "Unstarted legacy plan cancelled")
         conn.commit()
     return {"id": experiment_id, "status": "CANCELLED", "stopped_at": stopped_at}
 
@@ -252,7 +488,7 @@ def list_audit_events(limit: int = 100) -> list[dict]:
         raise HTTPException(status_code=422, detail="limit must be between 1 and 500")
     with closing(db()) as conn:
         rows = conn.execute(
-            "SELECT id, event_type, resource_id, details, created_at FROM audit_events ORDER BY id DESC LIMIT ?",
+            "SELECT id,event_type,resource_id,details,created_at FROM audit_events ORDER BY id DESC LIMIT ?",
             (limit,),
         ).fetchall()
     return [dict(row) for row in rows]
